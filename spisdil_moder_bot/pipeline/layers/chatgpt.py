@@ -41,8 +41,9 @@ class ChatGPTLayer(ModerationLayer):
             "Strict moderation. Output format: single JSON only.\n"
             "{\"violation\":bool,\"category\":str,\"severity\":str,\"action\":str,\"reason\":str}\n"
             "Allowed actions: warn, delete, mute, ban, none (lowercase).\n"
-            "If the user message lists allowed categories, you MUST pick one of them only when the content clearly fits.\n"
-            "If none of the allowed categories apply, respond with violation=false and action='none'.\n"
+            "You will receive the list of active moderation rules (category, configured action, human description).\n"
+            "Flag content only when it clearly violates one of those descriptions and return that exact category.\n"
+            "If none apply, respond with violation=false and action='none'.\n"
             "No text before/after JSON. No explanations. No markdown. No reasoning."
         )
 
@@ -53,13 +54,9 @@ class ChatGPTLayer(ModerationLayer):
             return None
 
         available_rules = await self._rules.get_rules_for_layer(LayerType.CHATGPT, chat_id=message.context.chat_id)
-        available_categories = sorted(
-            {rule.category for rule in available_rules if rule.category},
-            key=str.lower,
-        )
         user_payload = self._build_user_payload(
             message,
-            available_categories=available_categories if available_categories else None,
+            available_rules=[rule for rule in available_rules if rule.category] or None,
         )
         request = ChatCompletionRequest(
             model=self._model,
@@ -251,7 +248,7 @@ class ChatGPTLayer(ModerationLayer):
         self,
         message: MessageEnvelope,
         *,
-        available_categories: Optional[list[str]] = None,
+        available_rules: Optional[list[ModerationRule]] = None,
     ) -> str:
         context_parts = [
             f"chat_id: {message.context.chat_id}",
@@ -265,13 +262,24 @@ class ChatGPTLayer(ModerationLayer):
             "Moderation context:",
             *context_parts,
         ]
-        if available_categories:
-            joined = ", ".join(available_categories)
+        if available_rules:
+            lines.extend(["", "Active moderation rules (category — action — description):"])
+            sorted_rules = sorted(
+                available_rules,
+                key=lambda rule: (rule.category or "", rule.action.value),
+            )
+            for rule in sorted_rules:
+                lines.append(
+                    f"- {rule.category} — {rule.action.value} — {rule.description or 'no description'}"
+                )
+            categories = ", ".join(
+                sorted({rule.category for rule in available_rules if rule.category}, key=str.lower)
+            )
             lines.extend(
                 [
                     "",
-                    "Allowed categories (return a value from this list only if it clearly matches; otherwise reply with violation=false):",
-                    joined,
+                    "Allowed categories (use one only if the message clearly violates the matching rule):",
+                    categories,
                 ]
             )
         lines.extend(["", "Message:", message.content_text() or "<empty>"])
