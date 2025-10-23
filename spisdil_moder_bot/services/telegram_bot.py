@@ -223,6 +223,11 @@ class TelegramModerationApp:
             "data": {"action": None, "duration": None},
         }
         self._set_status(session, "Создание правила: выберите действие.")
+        logger.debug(
+            "wizard_add_started",
+            user_id=user_id,
+            chat_id=chat_id,
+        )
         await self._send_add_action_keyboard(user_id, chat_id)
 
     async def _send_add_action_keyboard(self, user_id: int, chat_id: Optional[int]) -> None:
@@ -326,6 +331,13 @@ class TelegramModerationApp:
         action: ActionType = flow["data"]["action"]
         duration = flow["data"].get("duration")
         chat_id = flow.get("chat_id")
+        logger.debug(
+            "wizard_add_description_received",
+            user_id=user_id,
+            chat_id=chat_id,
+            action=action.value if action else None,
+            duration=duration,
+        )
         try:
             rule = await self.coordinator.add_rule(
                 description,
@@ -344,6 +356,12 @@ class TelegramModerationApp:
                 f"Rule {rule.rule_id} added for {scope_label}.",
             )
             self._set_status(session, f"✅ Добавлено правило `{rule.rule_id}`.")
+            logger.info(
+                "wizard_rule_added",
+                user_id=user_id,
+                chat_id=rule.chat_id,
+                rule_id=rule.rule_id,
+            )
         finally:
             session["flow"] = None
 
@@ -689,6 +707,11 @@ class TelegramModerationApp:
 
         if not flow:
             await callback.message.answer("Нет активного действия. Используйте меню.")
+            logger.debug(
+                "wizard_callback_missing_flow",
+                user_id=user_id,
+                data=callback.data,
+            )
             await self._render_admin_panel(session=session, user_id=user_id)
             return
 
@@ -778,6 +801,7 @@ class TelegramModerationApp:
         text = (message.text or message.caption or "").strip()
         if not flow:
             await message.answer("Используйте меню ниже для управления правилами.")
+            logger.debug("wizard_message_without_flow", user_id=user_id, text=text)
             await self._render_admin_panel(session=session, user_id=user_id)
             return
 
@@ -789,6 +813,12 @@ class TelegramModerationApp:
 
         if flow.get("type") == "add":
             stage = flow.get("stage")
+            logger.debug(
+                "wizard_add_message",
+                user_id=user_id,
+                stage=stage,
+                text=text,
+            )
             if stage == "await_custom_duration":
                 try:
                     duration = self._parse_duration(text)
