@@ -585,21 +585,41 @@ class TelegramModerationApp:
                     f"✅ Добавлено глобальное правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
                 )
             elif pending == "remove":
-                rule_id = text
+                rule_id = text.strip()
                 if lower.startswith("remove"):
                     parts = text.split(maxsplit=1)
                     if len(parts) < 2:
                         await message.answer("Укажите `rule_id` после команды или отправьте `cancel`.")
                         return
                     rule_id = parts[1].strip()
+                if not rule_id:
+                    await message.answer("Укажите `rule_id` или отмените действие.")
+                    return
                 try:
-                    await self.coordinator.remove_rule(rule_id)
-                    await message.answer(f"Removed rule {rule_id}")
-                    session["last_status"] = f"🗑 Удалено правило `{rule_id}`."
+                    rules = await self.coordinator.list_rules()
+                    target_rule = next((rule for rule in rules if rule.rule_id == rule_id), None)
                 except Exception as exc:  # pylint: disable=broad-except
-                    logger.error("remove_rule_failed", error=str(exc))
-                    await message.answer("Failed to remove rule. Check logs.")
-                    session["last_status"] = "⚠️ Не удалось удалить правило."
+                    logger.error("remove_rule_lookup_failed", error=str(exc))
+                    target_rule = None
+                if not target_rule:
+                    await message.answer(f"Rule `{rule_id}` не найден.")
+                    session["last_status"] = f"⚠️ Правило `{rule_id}` не найдено."
+                else:
+                    if (
+                        target_rule.chat_id is not None
+                        and not await self._ensure_admin(target_rule.chat_id, user_id)
+                    ):
+                        await message.answer("You are not an admin in that chat.")
+                        session["last_status"] = "⚠️ Недостаточно прав для удаления правила."
+                    else:
+                        try:
+                            await self.coordinator.remove_rule(rule_id)
+                            await message.answer(f"Removed rule {rule_id}")
+                            session["last_status"] = f"🗑 Удалено правило `{rule_id}`."
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.error("remove_rule_failed", error=str(exc))
+                            await message.answer("Failed to remove rule. Check logs.")
+                            session["last_status"] = "⚠️ Не удалось удалить правило."
             session["pending_action"] = None
             await self._render_admin_panel(session=session, user_id=user_id)
             return
