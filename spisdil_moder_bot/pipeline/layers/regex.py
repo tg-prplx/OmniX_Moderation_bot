@@ -8,12 +8,13 @@ from typing import Optional
 import structlog
 
 try:
-    import regex as regex_lib
-except ImportError:  # pragma: no cover - fallback when optional dependency missing
-    import re as regex_lib  # type: ignore[no-redef]
-    _REGEX_BACKEND = "re"
-else:
+    import regex as _regex_module
+    regex_lib = _regex_module
     _REGEX_BACKEND = "regex"
+except ImportError:
+    import re as _regex_module
+    regex_lib = _regex_module
+    _REGEX_BACKEND = "re"
 
 from ...models import LayerType, MessageEnvelope, ModerationVerdict
 from ...models import ModerationRule, ViolationPriority
@@ -46,7 +47,7 @@ class RegexLayer(ModerationLayer, WarmupCapable):
             return
         try:
             compiled = regex_lib.compile(rule.pattern, regex_lib.IGNORECASE | regex_lib.MULTILINE)
-        except Exception as exc:  # pragma: no cover - compilation errors are logged
+        except Exception as exc:
             logger.error(
                 "regex_compile_failed",
                 rule_id=rule.rule_id,

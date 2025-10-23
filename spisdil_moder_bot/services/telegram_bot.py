@@ -333,7 +333,7 @@ class TelegramModerationApp:
                 chat_id=chat_id,
                 action_duration_seconds=duration,
             )
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             logger.error("wizard_add_rule_failed", error=str(exc))
             await self.bot.send_message(user_id, "Не удалось создать правило. Проверьте логи.")
             self._set_status(session, "⚠️ Ошибка при создании правила.")
@@ -410,7 +410,7 @@ class TelegramModerationApp:
                 category=category,
                 pattern=pattern,
             )
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             logger.error("add_rule_failed", error=str(exc))
             await message.reply("Failed to add rule. Check logs for details.")
             return
@@ -432,7 +432,7 @@ class TelegramModerationApp:
         rule_id = args[1].strip()
         try:
             await self.coordinator.remove_rule(rule_id)
-        except Exception as exc:  # pylint: disable=broad-except
+        except Exception as exc:
             logger.error("remove_rule_failed", error=str(exc))
             return
         await message.reply(f"🗑 Rule {rule_id} removed.")
@@ -524,7 +524,7 @@ class TelegramModerationApp:
                         f"Правило: <code>{rule_ref}</code>",
                         parse_mode="HTML",
                     )
-        except Exception as exc:  # pragma: no cover - network errors
+        except Exception as exc:
             logger.error(
                 "telegram_decision_error",
                 error=str(exc),
@@ -536,7 +536,7 @@ class TelegramModerationApp:
         if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE}:
             return
         if message.text and message.text.startswith('/'):
-            return  # commands handled separately
+            return
         if message.chat.type != ChatType.PRIVATE:
             self._remember_chat(message.chat)
         else:
@@ -739,7 +739,7 @@ class TelegramModerationApp:
                 try:
                     rules = await self.coordinator.list_rules(chat_id)
                     target_rule = next((rule for rule in rules if rule.rule_id == rule_id), None)
-                except Exception as exc:  # pylint: disable=broad-except
+                except Exception as exc:
                     logger.error("wizard_remove_lookup_failed", error=str(exc))
                     target_rule = None
                 if not target_rule:
@@ -757,7 +757,7 @@ class TelegramModerationApp:
                             await self.coordinator.remove_rule(rule_id)
                             await callback.message.answer(f"Removed rule {rule_id}")
                             self._set_status(session, f"🗑 Удалено правило `{rule_id}`.")
-                        except Exception as exc:  # pylint: disable=broad-except
+                        except Exception as exc:
                             logger.error("wizard_remove_failed", error=str(exc))
                             await callback.message.answer("Не удалось удалить правило.")
                             self._set_status(session, "⚠️ Не удалось удалить правило.")
@@ -769,7 +769,7 @@ class TelegramModerationApp:
 
     async def _handle_admin_text(self, message: Message) -> None:
         if message.text and message.text.startswith("/"):
-            return  # slash commands handled separately
+            return
         user_id = message.from_user.id
         session = self._admin_sessions.get(user_id)
         if not session or "chat_id" not in session:
@@ -875,7 +875,6 @@ class TelegramModerationApp:
             duration_part = duration_part.strip()
             if not duration_part:
                 raise ValueError("Duration must follow the action, e.g. mute:10m")
-            # allow formats like "10m текст" by taking first token as duration
             duration_token = duration_part.split()[0]
             duration = self._parse_duration(duration_token)
         try:

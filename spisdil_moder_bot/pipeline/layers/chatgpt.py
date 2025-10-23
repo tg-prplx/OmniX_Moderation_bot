@@ -78,7 +78,7 @@ class ChatGPTLayer(ModerationLayer):
                 {"role": "system", "content": self._system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            max_completion_tokens=2048,  # Max for gpt-5-nano
+            max_completion_tokens=2048,
             response_format={"type": "json_object"},
         )
         async with self._semaphore:
@@ -105,7 +105,6 @@ class ChatGPTLayer(ModerationLayer):
                 logger.error("chatgpt_api_error", error=str(exc), message_id=message.context.message_id)
                 return None
 
-        # Check if response was truncated
         if completion.finish_reason == "length":
             logger.warning(
                 "chatgpt_response_truncated",
@@ -145,7 +144,6 @@ class ChatGPTLayer(ModerationLayer):
         gpt_suggested_action = self._action_from_payload(data.get("action", "warn"))
         rule = await self._resolve_rule(category, chat_id=message.context.chat_id)
 
-        # If no matching rule found, don't create violation
         if not rule:
             logger.warning(
                 "chatgpt_violation_no_rule",
@@ -191,12 +189,10 @@ class ChatGPTLayer(ModerationLayer):
         stripped = content.strip()
         if not stripped:
             raise json.JSONDecodeError("Empty response after stripping", stripped, 0)
-        # Try direct parse
         try:
             return json.loads(stripped.strip("` \n"))
         except json.JSONDecodeError:
             pass
-        # Try to find JSON object in markdown code blocks
         start = stripped.find("{")
         end = stripped.rfind("}")
         if start != -1 and end != -1 and end > start:
