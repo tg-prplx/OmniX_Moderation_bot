@@ -21,6 +21,7 @@ from aiogram.types import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ForceReply,
     Message,
 )
 
@@ -33,6 +34,7 @@ logger = structlog.get_logger(__name__)
 
 PANEL_HELP = (
     "🔧 *Панель администратора*\n"
+    "• В личке используйте `/panel` и кнопки меню — все операции доступны из клавиатуры.\n"
     "• `list` — показать правила выбранного чата\n"
     "• `add <действие:время> <описание>` — добавить правило в чат (например, `mute:10m реклама`)\n"
     "• `add-global <действие:время> <описание>` — добавить глобальное правило\n"
@@ -74,6 +76,7 @@ class TelegramModerationApp:
         self.dispatcher.message(lambda msg: msg.chat.type == ChatType.PRIVATE)(self._handle_admin_text)
         self.dispatcher.callback_query(F.data.startswith("panel:chat:"))(self._handle_panel_select)
         self.dispatcher.callback_query(F.data.startswith("panel:action:"))(self._handle_panel_action)
+        self.dispatcher.callback_query(F.data.startswith("panel:wizard:"))(self._handle_wizard_callback)
         self.dispatcher.my_chat_member()(self._handle_my_chat_member)
 
     def _build_chat_selector_keyboard(self, admin_chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
@@ -124,20 +127,13 @@ class TelegramModerationApp:
         chat_id = session.get("chat_id")
         chat_title = session.get("chat_title") or ("Global rules" if chat_id is None else str(chat_id))
         chat_key = "global" if chat_id is None else str(chat_id)
-        status_line = session.get("last_status") or "Используйте кнопки ниже, чтобы управлять правилами."
-        pending_action = session.get("pending_action")
-        if pending_action == "add":
-            status_line = "✏️ Отправьте новое правило в формате `<действие[:время]> <описание>` или `cancel`."
-        elif pending_action == "add_global":
-            status_line = "✏️ Отправьте глобальное правило в формате `<действие[:время]> <описание>` или `cancel`."
-        elif pending_action == "remove":
-            status_line = "✏️ Отправьте `rule_id`, который нужно удалить, или `cancel`."
+        status_line = session.get("status_message") or "Используйте кнопки ниже для действий с правилами."
 
         text = (
             f"*Управление чатом:* {chat_title}\n"
             f"`ID:` {chat_id if chat_id is not None else 'global'}\n\n"
             f"{status_line}\n\n"
-            f"{PANEL_HELP}"
+            "Доступно: просмотр активных правил, создание новых, удаление существующих, переключение чата."
         )
         keyboard = self._build_admin_menu(chat_key, include_global_shortcut=chat_id is not None)
         if message is not None:
@@ -181,14 +177,14 @@ class TelegramModerationApp:
         keyboard = self._build_chat_selector_keyboard(admin_chats)
         text = (
             "Выберите чат, которым хотите управлять.\n"
-            "Можно использовать кнопки ниже или команду `set <chat_id>`."
+            "Используйте кнопки ниже."
         )
         if replace:
             rendered = await target_message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
         else:
             rendered = await target_message.reply(text, parse_mode="Markdown", reply_markup=keyboard)
         session = self._admin_sessions.setdefault(user_id, {})
-        session["pending_action"] = None
+        session["flow"] = None
         session["panel_message_id"] = rendered.message_id
 
     def _format_rules_markdown(self, rules) -> str:
@@ -209,6 +205,152 @@ class TelegramModerationApp:
 
     def _format_reason(self, reason: str) -> str:
         return html.escape(reason or "—")
+
+    def _set_status(self, session: dict, message: str) -> None:
+        session["status_message"] = message
+
+    async def _start_add_wizard(
+        self,
+        session: dict,
+        *,
+        user_id: int,
+        chat_id: Optional[int],
+    ) -> None:
+        session["flow"] = {
+            "type": "add",
+            "stage": "choose_action",
+            "chat_id": chat_id,
+            "data": {"action": None, "duration": None},
+        }
+        self._set_status(session, "Создание правила: выберите действие.")
+        await self._send_add_action_keyboard(user_id, chat_id)
+
+    async def _send_add_action_keyboard(self, user_id: int, chat_id: Optional[int]) -> None:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="⚠️ Warn", callback_data="panel:wizard:add:action:warn"),
+                    InlineKeyboardButton(text="🗑 Delete", callback_data="panel:wizard:add:action:delete"),
+                ],
+                [
+                    InlineKeyboardButton(text="🔇 Mute", callback_data="panel:wizard:add:action:mute"),
+                    InlineKeyboardButton(text="🚫 Ban", callback_data="panel:wizard:add:action:ban"),
+                ],
+                [InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:wizard:cancel")],
+            ]
+        )
+        scope = "глобального" if chat_id is None else "выбранного"
+        await self.bot.send_message(
+            user_id,
+            f"Выберите действие для {scope} правила:",
+            reply_markup=keyboard,
+        )
+
+    async def _send_add_duration_keyboard(self, user_id: int) -> None:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="5м", callback_data="panel:wizard:add:duration:300"),
+                    InlineKeyboardButton(text="10м", callback_data="panel:wizard:add:duration:600"),
+                    InlineKeyboardButton(text="30м", callback_data="panel:wizard:add:duration:1800"),
+                ],
+                [
+                    InlineKeyboardButton(text="1ч", callback_data="panel:wizard:add:duration:3600"),
+                    InlineKeyboardButton(text="24ч", callback_data="panel:wizard:add:duration:86400"),
+                    InlineKeyboardButton(text="Без срока", callback_data="panel:wizard:add:duration:none"),
+                ],
+                [
+                    InlineKeyboardButton(text="Другая длительность", callback_data="panel:wizard:add:duration:custom"),
+                ],
+                [InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:wizard:cancel")],
+            ]
+        )
+        await self.bot.send_message(
+            user_id,
+            "Выберите длительность наказания или задайте свою:",
+            reply_markup=keyboard,
+        )
+
+    async def _request_add_description(self, session: dict, user_id: int) -> None:
+        session["flow"]["stage"] = "await_description"
+        self._set_status(session, "Создание правила: введите описание.")
+        await self.bot.send_message(
+            user_id,
+            "Введите описание правила (что запрещено и почему):",
+            reply_markup=ForceReply(input_field_placeholder="Описание правила"),
+        )
+
+    async def _start_remove_wizard(
+        self,
+        session: dict,
+        *,
+        user_id: int,
+        chat_id: Optional[int],
+    ) -> None:
+        rules = await self.coordinator.list_rules(chat_id)
+        if not rules:
+            self._set_status(session, "Правил для удаления нет.")
+            await self.bot.send_message(user_id, "Правила не найдены.")
+            return
+
+        session["flow"] = {
+            "type": "remove",
+            "stage": "choose_rule",
+            "chat_id": chat_id,
+        }
+        self._set_status(session, "Удаление правила: выберите запись из списка.")
+        buttons = []
+        for rule in rules[:12]:
+            label = self._format_rule_button(rule)
+            buttons.append([InlineKeyboardButton(text=label, callback_data=f"panel:wizard:remove:select:{rule.rule_id}")])
+        buttons.append([InlineKeyboardButton(text="✖️ Отмена", callback_data="panel:wizard:cancel")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        await self.bot.send_message(
+            user_id,
+            "Выберите правило, которое нужно удалить:",
+            reply_markup=keyboard,
+        )
+
+    def _format_rule_button(self, rule: ModerationRule) -> str:
+        action_label = self._format_action_label(rule.action, rule.action_duration_seconds)
+        text = f"{action_label} • {rule.layer.value}"
+        description = (rule.description or "").strip()
+        if description:
+            text += f" — {description[:40]}" + ("…" if len(description) > 40 else "")
+        return text[:64]
+
+    async def _complete_add_flow(self, session: dict, user_id: int, description: str) -> None:
+        flow = session.get("flow")
+        if not flow or flow.get("type") != "add":
+            return
+        action: ActionType = flow["data"]["action"]
+        duration = flow["data"].get("duration")
+        chat_id = flow.get("chat_id")
+        try:
+            rule = await self.coordinator.add_rule(
+                description,
+                action,
+                chat_id=chat_id,
+                action_duration_seconds=duration,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("wizard_add_rule_failed", error=str(exc))
+            await self.bot.send_message(user_id, "Не удалось создать правило. Проверьте логи.")
+            self._set_status(session, "⚠️ Ошибка при создании правила.")
+        else:
+            scope_label = "global" if rule.chat_id is None else f"chat {rule.chat_id}"
+            await self.bot.send_message(
+                user_id,
+                f"Rule {rule.rule_id} added for {scope_label}.",
+            )
+            self._set_status(session, f"✅ Добавлено правило `{rule.rule_id}`.")
+        finally:
+            session["flow"] = None
+
+    async def _cancel_flow(self, session: dict, user_id: int) -> None:
+        session["flow"] = None
+        self._set_status(session, "Действие отменено.")
+        await self.bot.send_message(user_id, "Отменено. Используйте меню для следующего действия.")
 
     async def _handle_help_command(self, message: Message) -> None:
         if message.chat.type == ChatType.PRIVATE:
@@ -488,8 +630,8 @@ class TelegramModerationApp:
             {
                 "chat_id": chat_id,
                 "chat_title": chat_title,
-                "pending_action": None,
-                "last_status": "Используйте кнопки ниже, чтобы управлять правилами.",
+                "flow": None,
+                "status_message": "Используйте кнопки ниже для действий с правилами.",
             }
         )
         await self._render_admin_panel(session=session, message=callback.message, user_id=user_id)
@@ -514,42 +656,116 @@ class TelegramModerationApp:
         if action == "list":
             rules = await self.coordinator.list_rules(chat_id)
             await callback.message.answer(self._format_rules_markdown(rules), parse_mode="Markdown")
-            session["last_status"] = "📋 Отправил актуальный список правил ниже."
+            self._set_status(session, "📋 Список правил отправлен ниже.")
         elif action == "refresh":
-            session["last_status"] = "🔄 Панель обновлена."
+            self._set_status(session, "🔄 Панель обновлена.")
         elif action == "add":
-            if chat_id is None:
-                session["pending_action"] = "add_global"
-                prompt = (
-                    "Отправьте глобальное правило в формате `warn:1h описание` (время необязательно). "
-                    "Пример: `ban продажа наркотиков`. Напишите `cancel`, чтобы отменить."
-                )
-            else:
-                session["pending_action"] = "add"
-                prompt = (
-                    "Отправьте новое правило в формате `warn:10m описание` (время необязательно). "
-                    "Можно добавлять `category=...` или `layer=...`. Напишите `cancel`, чтобы отменить."
-                )
-            session["last_status"] = None
-            await callback.message.answer(prompt, parse_mode="Markdown")
+            await self._start_add_wizard(session, user_id=user_id, chat_id=chat_id)
         elif action == "remove":
-            session["pending_action"] = "remove"
-            session["last_status"] = None
-            await callback.message.answer(
-                "Отправьте `rule_id`, который нужно удалить. Напишите `cancel`, чтобы отменить.",
-                parse_mode="Markdown",
-            )
+            await self._start_remove_wizard(session, user_id=user_id, chat_id=chat_id)
         elif action == "help":
             await callback.message.answer(PANEL_HELP, parse_mode="Markdown")
-            session["last_status"] = "ℹ️ Отправил памятку ниже."
+            self._set_status(session, "ℹ️ Памятка отправлена.")
         elif action == "switch":
-            session["pending_action"] = None
-            session["last_status"] = "Выберите чат из списка."
+            session["flow"] = None
+            self._set_status(session, "Выберите чат из списка.")
             await self._prompt_chat_selection(callback.message, user_id, replace=True)
             return
         else:
-            session["last_status"] = "Неизвестное действие."
+            self._set_status(session, "Неизвестное действие.")
         await self._render_admin_panel(session=session, message=callback.message, user_id=user_id)
+
+    async def _handle_wizard_callback(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        parts = callback.data.split(":")
+        user_id = callback.from_user.id
+        session = self._admin_sessions.get(user_id)
+        if not session:
+            await callback.message.answer("Сессия устарела. Отправьте /panel ещё раз.")
+            return
+        flow = session.get("flow")
+
+        if len(parts) >= 3 and parts[2] == "cancel":
+            await self._cancel_flow(session, user_id)
+            await self._render_admin_panel(session=session, user_id=user_id)
+            return
+
+        if not flow:
+            await callback.message.answer("Нет активного действия. Используйте меню.")
+            return
+
+        if parts[2] == "add":
+            if len(parts) >= 5 and parts[3] == "action":
+                action_value = parts[4]
+                try:
+                    action = ActionType(action_value)
+                except ValueError:
+                    await callback.message.answer("Неизвестное действие. Выберите кнопку снова.")
+                    return
+                flow["data"]["action"] = action
+                if action in {ActionType.MUTE, ActionType.BAN}:
+                    flow["stage"] = "choose_duration"
+                    self._set_status(session, "Создание правила: выберите длительность наказания.")
+                    await self._send_add_duration_keyboard(user_id)
+                else:
+                    flow["data"]["duration"] = None
+                    await self._request_add_description(session, user_id)
+            elif len(parts) >= 5 and parts[3] == "duration":
+                value = parts[4]
+                if value == "custom":
+                    flow["stage"] = "await_custom_duration"
+                    self._set_status(session, "Введите длительность (например 10m, 2h, 3d).")
+                    await self.bot.send_message(
+                        user_id,
+                        "Введите длительность наказания:",
+                        reply_markup=ForceReply(input_field_placeholder="Например 30m"),
+                    )
+                else:
+                    if value == "none":
+                        flow["data"]["duration"] = None
+                    else:
+                        try:
+                            flow["data"]["duration"] = int(value)
+                        except ValueError:
+                            await callback.message.answer("Неверный формат длительности.")
+                            return
+                    await self._request_add_description(session, user_id)
+            else:
+                await callback.message.answer("Неизвестный шаг мастера.")
+        elif parts[2] == "remove":
+            if len(parts) >= 5 and parts[3] == "select":
+                rule_id = parts[4]
+                chat_id = flow.get("chat_id")
+                try:
+                    rules = await self.coordinator.list_rules(chat_id)
+                    target_rule = next((rule for rule in rules if rule.rule_id == rule_id), None)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error("wizard_remove_lookup_failed", error=str(exc))
+                    target_rule = None
+                if not target_rule:
+                    await callback.message.answer("Правило не найдено. Обновите список.")
+                    self._set_status(session, "⚠️ Правило не найдено при удалении.")
+                else:
+                    if (
+                        target_rule.chat_id is not None
+                        and not await self._ensure_admin(target_rule.chat_id, user_id)
+                    ):
+                        await callback.message.answer("Недостаточно прав для удаления правила.")
+                        self._set_status(session, "⚠️ Недостаточно прав.")
+                    else:
+                        try:
+                            await self.coordinator.remove_rule(rule_id)
+                            await callback.message.answer(f"Removed rule {rule_id}")
+                            self._set_status(session, f"🗑 Удалено правило `{rule_id}`.")
+                        except Exception as exc:  # pylint: disable=broad-except
+                            logger.error("wizard_remove_failed", error=str(exc))
+                            await callback.message.answer("Не удалось удалить правило.")
+                            self._set_status(session, "⚠️ Не удалось удалить правило.")
+                session["flow"] = None
+        else:
+            await callback.message.answer("Неизвестное действие мастера.")
+
+        await self._render_admin_panel(session=session, user_id=user_id)
 
     async def _handle_admin_text(self, message: Message) -> None:
         if message.text and message.text.startswith("/"):
@@ -560,200 +776,39 @@ class TelegramModerationApp:
             await message.answer("Send /panel to choose a chat to manage.")
             return
 
+        flow = session.get("flow")
         text = (message.text or message.caption or "").strip()
-        if not text:
-            await message.answer(PANEL_HELP, parse_mode="Markdown")
-            return
-
-        pending = session.get("pending_action")
-        if pending:
-            lower = text.lower()
-            if lower == "cancel":
-                session["pending_action"] = None
-                session["last_status"] = "✋ Действие отменено."
-                await message.answer("Отменено. Выберите следующее действие в панели.")
-                await self._render_admin_panel(session=session, user_id=user_id)
-                return
-            if pending == "add":
-                rule = await self._admin_add_rule(message, session.get("chat_id"), command=f"add {text}")
-                session["last_status"] = (
-                    f"✅ Добавлено правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
-                )
-            elif pending == "add_global":
-                rule = await self._admin_add_rule(message, chat_id=None, command=f"add-global {text}")
-                session["last_status"] = (
-                    f"✅ Добавлено глобальное правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
-                )
-            elif pending == "remove":
-                rule_id = text.strip()
-                if lower.startswith("remove"):
-                    parts = text.split(maxsplit=1)
-                    if len(parts) < 2:
-                        await message.answer("Укажите `rule_id` после команды или отправьте `cancel`.")
-                        return
-                    rule_id = parts[1].strip()
-                if not rule_id:
-                    await message.answer("Укажите `rule_id` или отмените действие.")
-                    return
-                try:
-                    rules = await self.coordinator.list_rules()
-                    target_rule = next((rule for rule in rules if rule.rule_id == rule_id), None)
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.error("remove_rule_lookup_failed", error=str(exc))
-                    target_rule = None
-                if not target_rule:
-                    await message.answer(f"Rule `{rule_id}` не найден.")
-                    session["last_status"] = f"⚠️ Правило `{rule_id}` не найдено."
-                else:
-                    if (
-                        target_rule.chat_id is not None
-                        and not await self._ensure_admin(target_rule.chat_id, user_id)
-                    ):
-                        await message.answer("You are not an admin in that chat.")
-                        session["last_status"] = "⚠️ Недостаточно прав для удаления правила."
-                    else:
-                        try:
-                            await self.coordinator.remove_rule(rule_id)
-                            await message.answer(f"Removed rule {rule_id}")
-                            session["last_status"] = f"🗑 Удалено правило `{rule_id}`."
-                        except Exception as exc:  # pylint: disable=broad-except
-                            logger.error("remove_rule_failed", error=str(exc))
-                            await message.answer("Failed to remove rule. Check logs.")
-                            session["last_status"] = "⚠️ Не удалось удалить правило."
-            session["pending_action"] = None
-            await self._render_admin_panel(session=session, user_id=user_id)
+        if not flow:
+            await message.answer("Используйте меню ниже для управления правилами.")
             return
 
         lower = text.lower()
-        chat_id = session.get("chat_id")
-        if lower == "help":
-            await message.answer(PANEL_HELP, parse_mode="Markdown")
-            session["last_status"] = "ℹ️ Памятка отправлена."
+        if lower == "cancel":
+            await self._cancel_flow(session, user_id)
             await self._render_admin_panel(session=session, user_id=user_id)
             return
-        if lower == "list":
-            rules = await self.coordinator.list_rules(chat_id)
-            await message.answer(self._format_rules_markdown(rules), parse_mode="Markdown")
-            session["last_status"] = "📋 Список правил отправлен ниже."
-            await self._render_admin_panel(session=session, user_id=user_id)
-            return
-        if lower.startswith("remove"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                await message.answer("Usage: remove <rule_id>")
+
+        if flow.get("type") == "add":
+            stage = flow.get("stage")
+            if stage == "await_custom_duration":
+                try:
+                    duration = self._parse_duration(text)
+                except ValueError:
+                    await message.answer("Неверный формат. Используйте значения вроде 30s, 10m, 2h, 3d.")
+                    return
+                flow["data"]["duration"] = duration
+                await message.answer("Длительность сохранена.")
+                await self._request_add_description(session, user_id)
                 return
-            if chat_id is not None and not await self._ensure_admin(chat_id, user_id):
-                await message.answer("You are not an admin in that chat.")
-                return
-            try:
-                await self.coordinator.remove_rule(parts[1])
-                await message.answer(f"Removed rule {parts[1]}")
-                session["last_status"] = f"🗑 Удалено правило `{parts[1]}`."
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.error("remove_rule_failed", error=str(exc))
-                await message.answer("Failed to remove rule. Check logs.")
-                session["last_status"] = "⚠️ Не удалось удалить правило."
-            await self._render_admin_panel(session=session, user_id=user_id)
-            return
-        if lower.startswith("set"):
-            parts = text.split(maxsplit=1)
-            if len(parts) < 2:
-                await message.answer("Usage: set <chat_id|global>")
-                return
-            target = parts[1].strip().lower()
-            if target == "global":
-                session.update({"chat_id": None, "chat_title": "Глобальные правила", "pending_action": None})
-                await message.answer("Switched to global rules. Type `list` to see rules.", parse_mode="Markdown")
+            if stage == "await_description":
+                if not text:
+                    await message.answer("Описание не может быть пустым. Повторите ввод.")
+                    return
+                await self._complete_add_flow(session, user_id, text)
                 await self._render_admin_panel(session=session, user_id=user_id)
                 return
-            try:
-                new_chat_id = int(target)
-            except ValueError:
-                await message.answer("Chat ID must be an integer or `global`.")
-                return
-            if not await self._ensure_admin(new_chat_id, user_id):
-                await message.answer("You are not an admin in that chat.")
-                return
-            session.update(
-                {
-                    "chat_id": new_chat_id,
-                    "chat_title": self._chat_cache.get(new_chat_id, str(new_chat_id)),
-                    "pending_action": None,
-                }
-            )
-            await message.answer(f"Switched to chat {new_chat_id}. Type `list` to see rules.")
-            await self._render_admin_panel(session=session, user_id=user_id)
-            return
-        if lower.startswith("add-global"):
-            rule = await self._admin_add_rule(message, chat_id=None, command=text)
-            session["last_status"] = (
-                f"✅ Добавлено глобальное правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
-            )
-            await self._render_admin_panel(session=session, user_id=user_id)
-            return
-        if lower.startswith("add"):
-            if chat_id is None:
-                await message.answer("Выберите чат или используйте `add-global` для глобального правила.")
-                return
-            rule = await self._admin_add_rule(message, chat_id=chat_id, command=text)
-            session["last_status"] = (
-                f"✅ Добавлено правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
-            )
-            await self._render_admin_panel(session=session, user_id=user_id)
-            return
-        await message.answer("Unknown command. Type 'help' for instructions.")
 
-    async def _admin_add_rule(self, message: Message, chat_id: Optional[int], command: str) -> Optional[ModerationRule]:
-        tokens = shlex.split(command)
-        if len(tokens) < 3:
-            await message.answer("Usage: add <action[:duration]> [layer=...] [type=...] [category=...] <description>")
-            return None
-        _, action_token, *rest_tokens = tokens
-        try:
-            action, duration = self._parse_action_token(action_token)
-        except ValueError as exc:
-            await message.answer(str(exc))
-            return None
-
-        try:
-            layer_override, rule_type_override, category, pattern, description = self._extract_rule_metadata(rest_tokens)
-        except ValueError as exc:
-            await message.answer(str(exc))
-            return None
-
-        if duration is None and description:
-            first_word = description.split(maxsplit=1)[0]
-            if self._looks_like_duration(first_word):
-                try:
-                    duration = self._parse_duration(first_word)
-                except ValueError as exc:
-                    await message.answer(str(exc))
-                    return None
-                description = description.split(maxsplit=1)[1] if ' ' in description else ''
-        if not description:
-            await message.answer("Please provide rule description.")
-            return None
-        if chat_id is not None and not await self._ensure_admin(chat_id, message.from_user.id):
-            await message.answer("You are not an admin in that chat.")
-            return None
-        try:
-            rule = await self.coordinator.add_rule(
-                description,
-                action,
-                chat_id=chat_id,
-                action_duration_seconds=duration,
-                layer=layer_override,
-                rule_type=rule_type_override,
-                category=category,
-                pattern=pattern,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.error("panel_add_rule_failed", error=str(exc))
-            await message.answer("Failed to add rule. Check logs for details.")
-            return None
-        scope_label = "global" if chat_id is None else f"chat {chat_id}"
-        await message.answer(f"Rule {rule.rule_id} added for {scope_label}.")
-        return rule
+        await message.answer("Используйте меню ниже.")
 
     async def _available_admin_chats(self, user_id: int) -> list[tuple[int, str]]:
         chats = []
