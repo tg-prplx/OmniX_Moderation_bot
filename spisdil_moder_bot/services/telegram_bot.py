@@ -279,11 +279,12 @@ class TelegramModerationApp:
     async def _request_add_description(self, session: dict, user_id: int) -> None:
         session["flow"]["stage"] = "await_description"
         self._set_status(session, "Создание правила: введите описание.")
-        await self.bot.send_message(
+        prompt = await self.bot.send_message(
             user_id,
             "Введите описание правила (что запрещено и почему):",
             reply_markup=ForceReply(input_field_placeholder="Описание правила"),
         )
+        session["flow"]["prompt_message_id"] = prompt.message_id
 
     async def _start_remove_wizard(
         self,
@@ -818,6 +819,7 @@ class TelegramModerationApp:
                 user_id=user_id,
                 stage=stage,
                 text=text,
+                reply_to=(message.reply_to_message.message_id if message.reply_to_message else None),
             )
             if stage == "await_custom_duration":
                 try:
@@ -831,10 +833,18 @@ class TelegramModerationApp:
                 await self._request_add_description(session, user_id)
                 return
             if stage == "await_description":
+                prompt_id = flow.get("prompt_message_id")
+                if prompt_id and (
+                    not message.reply_to_message or message.reply_to_message.message_id != prompt_id
+                ):
+                    await message.answer("Ответьте на последнее сообщение с просьбой ввести описание.")
+                    await self._render_admin_panel(session=session, user_id=user_id)
+                    return
                 if not text:
                     await message.answer("Описание не может быть пустым. Повторите ввод.")
                     await self._render_admin_panel(session=session, user_id=user_id)
                     return
+                flow.pop("prompt_message_id", None)
                 await self._complete_add_flow(session, user_id, text)
                 await self._render_admin_panel(session=session, user_id=user_id)
                 return
