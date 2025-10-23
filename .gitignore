@@ -40,6 +40,7 @@ htmlcov/
 # Environment and local config
 .env
 .env.*
+!.env.example
 *.local
 
 # Databases

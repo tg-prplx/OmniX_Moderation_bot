@@ -1,12 +1,31 @@
 [project]
 name = "spisdil-moder-bot"
 version = "0.1.0"
-description = "Modular aiogram-based moderation bot with multi-layer pipeline."
+description = "Enterprise-ready Telegram moderation bot with layered AI enforcement and rule governance."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "SpisdilModerBotOSS Team" }
 ]
+license = { file = "LICENSE" }
+keywords = ["moderation", "telegram", "aiogram", "openai", "compliance", "middleware"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Communications :: Chat",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+urls = {
+    "Homepage" = "https://github.com/your-org/spisdil-moder-bot",
+    "Documentation" = "https://github.com/your-org/spisdil-moder-bot#readme",
+    "Source" = "https://github.com/your-org/spisdil-moder-bot",
+    "Changelog" = "https://github.com/your-org/spisdil-moder-bot/blob/master/CHANGELOG.md",
+}
 dependencies = [
     "aiogram>=3.4.1",
     "httpx>=0.27.0",
