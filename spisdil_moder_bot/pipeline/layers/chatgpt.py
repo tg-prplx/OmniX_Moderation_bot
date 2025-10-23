@@ -68,7 +68,7 @@ class ChatGPTLayer(ModerationLayer):
             for image in message.images[:4]:
                 user_content.append(
                     {
-                        "type": "input_image",
+                        "type": "image_url",
                         "image_url": {"url": image},
                     }
                 )
