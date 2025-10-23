@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Optional
 
 import structlog
+
+try:
+    import regex as regex_lib
+except ImportError:  # pragma: no cover - fallback when optional dependency missing
+    import re as regex_lib  # type: ignore[no-redef]
+    _REGEX_BACKEND = "re"
+else:
+    _REGEX_BACKEND = "regex"
 
 from ...models import LayerType, MessageEnvelope, ModerationVerdict
 from ...models import ModerationRule, ViolationPriority
@@ -24,7 +31,7 @@ class RegexLayer(ModerationLayer, WarmupCapable):
         super().__init__(priority=10)
         self._rules = rules
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="regex-layer")
-        self._compiled: dict[str, re.Pattern[str]] = {}
+        self._compiled: dict[str, Optional[regex_lib.Pattern]] = {}
         self._lock = asyncio.Lock()
 
     async def warmup(self) -> None:
@@ -35,8 +42,21 @@ class RegexLayer(ModerationLayer, WarmupCapable):
         logger.info("regex_layer_warmup_completed", rules=len(rules))
 
     def _compile_rule(self, rule: ModerationRule) -> None:
-        if rule.pattern and rule.rule_id not in self._compiled:
-            self._compiled[rule.rule_id] = re.compile(rule.pattern, re.IGNORECASE | re.MULTILINE)
+        if not rule.pattern or rule.rule_id in self._compiled:
+            return
+        try:
+            compiled = regex_lib.compile(rule.pattern, regex_lib.IGNORECASE | regex_lib.MULTILINE)
+        except Exception as exc:  # pragma: no cover - compilation errors are logged
+            logger.error(
+                "regex_compile_failed",
+                rule_id=rule.rule_id,
+                pattern=rule.pattern,
+                backend=_REGEX_BACKEND,
+                error=str(exc),
+            )
+            self._compiled[rule.rule_id] = None
+            return
+        self._compiled[rule.rule_id] = compiled
 
     async def evaluate(self, message: MessageEnvelope) -> ModerationVerdict | None:
         text = message.content_text()
