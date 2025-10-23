@@ -1,0 +1,49 @@
+# Byte-compiled / cached files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Build outputs
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+
+# Logs and coverage
+*.log
+log/
+logs/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Type checker and tooling caches
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# IDE settings
+.idea/
+.vscode/
+.nox/
+.cache/
+.claude/
+
+# Environment and local config
+.env
+.env.*
+*.local
+
+# Databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
