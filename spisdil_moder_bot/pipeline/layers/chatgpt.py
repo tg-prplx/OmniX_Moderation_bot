@@ -40,6 +40,8 @@ class ChatGPTLayer(ModerationLayer):
         self._system_prompt = (
             "Strict moderation. Output format: single JSON only.\n"
             "{\"violation\":bool,\"category\":str,\"severity\":str,\"action\":str,\"reason\":str}\n"
+            "Allowed actions: warn, delete, mute, ban, none (lowercase).\n"
+            "If user content lists allowed categories, pick exactly one of them; otherwise choose the closest match.\n"
             "No text before/after JSON. No explanations. No markdown. No reasoning."
         )
 
@@ -49,7 +51,15 @@ class ChatGPTLayer(ModerationLayer):
             logger.debug("chatgpt_skip_no_text", message_id=message.context.message_id)
             return None
 
-        user_payload = self._build_user_payload(message)
+        available_rules = await self._rules.get_rules_for_layer(LayerType.CHATGPT, chat_id=message.context.chat_id)
+        available_categories = sorted(
+            {rule.category for rule in available_rules if rule.category},
+            key=str.lower,
+        )
+        user_payload = self._build_user_payload(
+            message,
+            available_categories=available_categories if available_categories else None,
+        )
         request = ChatCompletionRequest(
             model=self._model,
             messages=[
@@ -217,13 +227,31 @@ class ChatGPTLayer(ModerationLayer):
         return mapping.get(severity, ViolationPriority.OTHER)
 
     def _action_from_payload(self, action: str) -> ActionType:
+        if not action:
+            return ActionType.WARN
+        normalized = action.strip().lower()
+        synonyms = {
+            "delete_message": "delete",
+            "remove_message": "delete",
+            "remove": "delete",
+            "kick": "ban",
+            "ban_user": "ban",
+            "no_action": "none",
+            "none": "none",
+        }
+        normalized = synonyms.get(normalized, normalized)
         try:
-            return ActionType(action)
+            return ActionType(normalized)
         except ValueError:
             logger.warning("chatgpt_unknown_action", action=action)
             return ActionType.WARN
 
-    def _build_user_payload(self, message: MessageEnvelope) -> str:
+    def _build_user_payload(
+        self,
+        message: MessageEnvelope,
+        *,
+        available_categories: Optional[list[str]] = None,
+    ) -> str:
         context_parts = [
             f"chat_id: {message.context.chat_id}",
             f"user_id: {message.context.user_id}",
@@ -232,9 +260,20 @@ class ChatGPTLayer(ModerationLayer):
         ]
         if message.context.username:
             context_parts.append(f"username: @{message.context.username}")
-        payload = "\n".join(context_parts)
-        content = message.content_text()
-        lines = [f"{payload}", "", "Message:", content or "<empty>"]
+        lines = [
+            "Moderation context:",
+            *context_parts,
+        ]
+        if available_categories:
+            joined = ", ".join(available_categories)
+            lines.extend(
+                [
+                    "",
+                    "Allowed categories (return exactly one value from this list):",
+                    joined,
+                ]
+            )
+        lines.extend(["", "Message:", message.content_text() or "<empty>"])
         if message.images:
             truncated = []
             for idx, img in enumerate(message.images[:3], start=1):
