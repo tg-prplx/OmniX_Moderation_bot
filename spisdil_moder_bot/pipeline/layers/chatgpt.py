@@ -58,11 +58,25 @@ class ChatGPTLayer(ModerationLayer):
             message,
             available_rules=[rule for rule in available_rules if rule.category] or None,
         )
+        user_content = [
+            {
+                "type": "text",
+                "text": user_payload,
+            }
+        ]
+        if message.images:
+            for image in message.images[:4]:
+                user_content.append(
+                    {
+                        "type": "input_image",
+                        "image_url": {"url": image},
+                    }
+                )
         request = ChatCompletionRequest(
             model=self._model,
             messages=[
                 {"role": "system", "content": self._system_prompt},
-                {"role": "user", "content": user_payload},
+                {"role": "user", "content": user_content},
             ],
             max_completion_tokens=2048,  # Max for gpt-5-nano
             response_format={"type": "json_object"},
@@ -284,11 +298,10 @@ class ChatGPTLayer(ModerationLayer):
             )
         lines.extend(["", "Message:", message.content_text() or "<empty>"])
         if message.images:
-            truncated = []
-            for idx, img in enumerate(message.images[:3], start=1):
-                snippet = (img[:60] + "...") if len(img) > 60 else img
-                truncated.append(f"Image {idx}: {snippet}")
-            if len(message.images) > 3:
-                truncated.append(f"... ({len(message.images) - 3} more images)")
-            lines.extend(["", f"Images present: {len(message.images)}", *truncated])
+            lines.extend(
+                [
+                    "",
+                    f"Images present: {len(message.images)} (content attached separately for analysis)",
+                ]
+            )
         return "\n".join(lines)
