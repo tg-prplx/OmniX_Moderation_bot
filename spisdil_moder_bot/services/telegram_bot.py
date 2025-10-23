@@ -537,13 +537,10 @@ class TelegramModerationApp:
             return
         if message.text and message.text.startswith('/'):
             return
-        if message.chat.type != ChatType.PRIVATE:
-            self._remember_chat(message.chat)
-        else:
-            command_text = (message.text or message.caption or '').strip().lower()
-            admin_prefixes = ("set", "add", "add-global", "remove", "list", "help")
-            if any(command_text.startswith(prefix) for prefix in admin_prefixes):
-                return
+        if message.chat.type == ChatType.PRIVATE:
+            return
+
+        self._remember_chat(message.chat)
 
         images = await self._collect_images(message)
         envelope = MessageEnvelope(
