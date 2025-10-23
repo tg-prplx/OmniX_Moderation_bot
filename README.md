@@ -1,3 +1,4 @@
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/851bd601-4a04-414f-a9e5-8e18bb50c606" />
 # Spisdil Moderation Bot
 
 Enterprise-ready Telegram moderation platform with layered AI enforcement, auditable rule management, and operator-friendly tooling.
