@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import shlex
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -24,21 +25,23 @@ from aiogram.types import (
 )
 
 from ..config import BotSettings
-from ..models import ActionType, ChatContext, LayerType, MessageEnvelope, RuleType
+from ..models import ActionType, ChatContext, LayerType, MessageEnvelope, ModerationRule, RuleType
 from ..punishments.aggregator import PunishmentDecision
 from .moderation_service import ModerationCoordinator
 
 logger = structlog.get_logger(__name__)
 
 PANEL_HELP = (
-    "🔧 *Admin Panel Commands*\n"
-    "`list` – show rules\n"
-    "`add <action[:duration]> <description>` – create chat rule (e.g. `add mute:10m реклама` "
-    "or `add mute 10m реклама`)\n"
-    "`add-global <action[:duration]> <description>` – create global rule\n"
-    "`remove <rule_id>` – delete rule\n"
-    "`set <chat_id>` – manually switch chat\n"
-    "`help` – show this message"
+    "🔧 *Панель администратора*\n"
+    "• `list` — показать правила выбранного чата\n"
+    "• `add <действие[:время]> <описание>` — добавить правило в чат\n"
+    "• `add-global <действие[:время]> <описание>` — добавить глобальное правило\n"
+    "• `remove <rule_id>` — удалить правило\n"
+    "• `set <chat_id>` — переключиться на другой чат вручную\n"
+    "• `help` — показать памятку\n"
+    "• `cancel` — отменить текущий ввод\n"
+    "\n"
+    "_Можно пользоваться меню ниже или командами вручную._"
 )
 
 
@@ -70,7 +73,142 @@ class TelegramModerationApp:
         self.dispatcher.message(F.text | F.caption | F.photo)(self._handle_message)
         self.dispatcher.message(lambda msg: msg.chat.type == ChatType.PRIVATE)(self._handle_admin_text)
         self.dispatcher.callback_query(F.data.startswith("panel:chat:"))(self._handle_panel_select)
+        self.dispatcher.callback_query(F.data.startswith("panel:action:"))(self._handle_panel_action)
         self.dispatcher.my_chat_member()(self._handle_my_chat_member)
+
+    def _build_chat_selector_keyboard(self, admin_chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="🌐 Global rules", callback_data="panel:chat:global")]
+        ]
+        for chat_id, title in admin_chats[:12]:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=title or str(chat_id),
+                        callback_data=f"panel:chat:{chat_id}",
+                    )
+                ]
+            )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _build_admin_menu(self, chat_key: str, *, include_global_shortcut: bool) -> InlineKeyboardMarkup:
+        buttons: list[list[InlineKeyboardButton]] = [
+            [
+                InlineKeyboardButton(text="📋 Список правил", callback_data=f"panel:action:list:{chat_key}"),
+                InlineKeyboardButton(text="🔄 Обновить", callback_data=f"panel:action:refresh:{chat_key}"),
+            ],
+            [
+                InlineKeyboardButton(text="➕ Добавить правило", callback_data=f"panel:action:add:{chat_key}"),
+                InlineKeyboardButton(text="➖ Удалить правило", callback_data=f"panel:action:remove:{chat_key}"),
+            ],
+        ]
+        if include_global_shortcut:
+            buttons.append(
+                [InlineKeyboardButton(text="🌐 Перейти к глобальным", callback_data="panel:chat:global")]
+            )
+        buttons.append(
+            [
+                InlineKeyboardButton(text="🔁 Сменить чат", callback_data=f"panel:action:switch:{chat_key}"),
+                InlineKeyboardButton(text="ℹ️ Помощь", callback_data=f"panel:action:help:{chat_key}"),
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    async def _render_admin_panel(
+        self,
+        *,
+        session: dict[str, Optional[int | str]],
+        message: Optional[Message] = None,
+        user_id: Optional[int] = None,
+    ) -> None:
+        chat_id = session.get("chat_id")
+        chat_title = session.get("chat_title") or ("Global rules" if chat_id is None else str(chat_id))
+        chat_key = "global" if chat_id is None else str(chat_id)
+        status_line = session.get("last_status") or "Используйте кнопки ниже, чтобы управлять правилами."
+        pending_action = session.get("pending_action")
+        if pending_action == "add":
+            status_line = "✏️ Отправьте новое правило в формате `<действие[:время]> <описание>` или `cancel`."
+        elif pending_action == "add_global":
+            status_line = "✏️ Отправьте глобальное правило в формате `<действие[:время]> <описание>` или `cancel`."
+        elif pending_action == "remove":
+            status_line = "✏️ Отправьте `rule_id`, который нужно удалить, или `cancel`."
+
+        text = (
+            f"*Управление чатом:* {chat_title}\n"
+            f"`ID:` {chat_id if chat_id is not None else 'global'}\n\n"
+            f"{status_line}\n\n"
+            f"{PANEL_HELP}"
+        )
+        keyboard = self._build_admin_menu(chat_key, include_global_shortcut=chat_id is not None)
+        if message is not None:
+            rendered = await message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        elif user_id is not None and session.get("panel_message_id"):
+            rendered = await self.bot.edit_message_text(
+                text=text,
+                chat_id=user_id,
+                message_id=session["panel_message_id"],
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        else:
+            rendered = await self.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        session["panel_message_id"] = rendered.message_id
+
+    async def _prompt_chat_selection(
+        self,
+        target_message: Message,
+        user_id: int,
+        *,
+        replace: bool = False,
+    ) -> None:
+        admin_chats = await self._available_admin_chats(user_id)
+        if not admin_chats:
+            text = (
+                "Пока что я не видел чатов, где вы админ.\n"
+                "Добавьте бота в нужные группы и напишите там любое сообщение, "
+                "либо отправьте `set <chat_id>` вручную."
+            )
+            if replace and target_message:
+                await target_message.edit_text(text, parse_mode="Markdown")
+            else:
+                await target_message.answer(text, parse_mode="Markdown")
+            return
+        keyboard = self._build_chat_selector_keyboard(admin_chats)
+        text = (
+            "Выберите чат, которым хотите управлять.\n"
+            "Можно использовать кнопки ниже или команду `set <chat_id>`."
+        )
+        if replace:
+            rendered = await target_message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        else:
+            rendered = await target_message.reply(text, parse_mode="Markdown", reply_markup=keyboard)
+        session = self._admin_sessions.setdefault(user_id, {})
+        session["pending_action"] = None
+        session["panel_message_id"] = rendered.message_id
+
+    def _format_rules_markdown(self, rules) -> str:
+        if not rules:
+            return "_Правила ещё не настроены._"
+        lines = [
+            f"• `{rule.rule_id}` — *{rule.layer.value}/{rule.rule_type.value}* — "
+            f"{self._format_action_label(rule.action, rule.action_duration_seconds)}\n"
+            f"  {rule.description}"
+            for rule in rules
+        ]
+        return "*Активные правила:*\n" + "\n".join(lines)
+
+    def _format_user_mention(self, ctx: ChatContext) -> str:
+        if ctx.username:
+            return f"@{html.escape(ctx.username)}"
+        return f'<a href="tg://user?id={ctx.user_id}">{ctx.user_id}</a>'
+
+    def _format_reason(self, reason: str) -> str:
+        return html.escape(reason or "—")
 
     async def _handle_help_command(self, message: Message) -> None:
         if message.chat.type == ChatType.PRIVATE:
@@ -170,16 +308,8 @@ class TelegramModerationApp:
                 await message.reply("You must be a chat admin to view protected rules.")
                 return
         rules = await self.coordinator.list_rules(chat_id)
-        if not rules:
-            await message.reply("No rules configured yet.")
-            return
-        lines = [
-            f"{rule.rule_id} [{rule.layer.value}|{rule.rule_type.value}] "
-            f"action={self._format_action_label(rule.action, rule.action_duration_seconds)} "
-            f"chat={rule.chat_id or 'global'} – {rule.description}"
-            for rule in rules
-        ]
-        await message.reply("📋 Active rules:\n" + "\n".join(lines))
+        text = self._format_rules_markdown(rules)
+        await message.reply(text, parse_mode="Markdown")
     async def _on_decision(self, decision: PunishmentDecision, result) -> None:
         verdict = decision.verdict
         ctx = result.message.context
@@ -192,13 +322,23 @@ class TelegramModerationApp:
             rule=verdict.rule_code,
             duration=duration_seconds,
         )
+        user_ref = self._format_user_mention(ctx)
+        rule_ref = html.escape(verdict.rule_code)
+        reason_html = self._format_reason(verdict.reason)
         try:
             if verdict.action == ActionType.DELETE:
                 await self.bot.delete_message(ctx.chat_id, ctx.message_id)
             elif verdict.action == ActionType.WARN:
+                text = (
+                    "⚠️ <b>Предупреждение</b>\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Причина: {reason_html}\n"
+                    f"Правило: <code>{rule_ref}</code>"
+                )
                 await self.bot.send_message(
                     ctx.chat_id,
-                    f"⚠️ Warning for @{ctx.username or ctx.user_id}: {verdict.reason}",
+                    text,
+                    parse_mode="HTML",
                     reply_to_message_id=ctx.message_id,
                 )
             elif verdict.action == ActionType.MUTE:
@@ -212,7 +352,12 @@ class TelegramModerationApp:
                 )
                 await self.bot.send_message(
                     ctx.chat_id,
-                    f"🔇 User @{ctx.username or ctx.user_id} muted for {self._humanize_duration(seconds)}: {verdict.reason}",
+                    "🔇 <b>Мут</b>\n"
+                    f"Пользователь: {user_ref}\n"
+                    f"Длительность: {html.escape(self._humanize_duration(seconds))}\n"
+                    f"Причина: {reason_html}\n"
+                    f"Правило: <code>{rule_ref}</code>",
+                    parse_mode="HTML",
                 )
             elif verdict.action == ActionType.BAN:
                 if duration_seconds:
@@ -220,13 +365,22 @@ class TelegramModerationApp:
                     await self.bot.ban_chat_member(ctx.chat_id, ctx.user_id, until_date=until)
                     await self.bot.send_message(
                         ctx.chat_id,
-                        f"🚫 User @{ctx.username or ctx.user_id} banned for {self._humanize_duration(duration_seconds)}: {verdict.reason}",
+                        "🚫 <b>Бан</b>\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Длительность: {html.escape(self._humanize_duration(duration_seconds))}\n"
+                        f"Причина: {reason_html}\n"
+                        f"Правило: <code>{rule_ref}</code>",
+                        parse_mode="HTML",
                     )
                 else:
                     await self.bot.ban_chat_member(ctx.chat_id, ctx.user_id)
                     await self.bot.send_message(
                         ctx.chat_id,
-                        f"🚫 User @{ctx.username or ctx.user_id} banned: {verdict.reason}",
+                        "🚫 <b>Бан</b>\n"
+                        f"Пользователь: {user_ref}\n"
+                        f"Причина: {reason_html}\n"
+                        f"Правило: <code>{rule_ref}</code>",
+                        parse_mode="HTML",
                     )
         except Exception as exc:  # pragma: no cover - network errors
             logger.error(
@@ -276,6 +430,7 @@ class TelegramModerationApp:
             images=len(images),
         )
         await self.coordinator.ingest(envelope)
+
     async def _collect_images(self, message: Message) -> list[str]:
         if not message.photo:
             return []
@@ -295,52 +450,6 @@ class TelegramModerationApp:
         if message.document and message.document.mime_type:
             return message.document.mime_type
         return None
-
-    async def _on_decision(self, decision: PunishmentDecision, result) -> None:
-        verdict = decision.verdict
-        ctx = result.message.context
-        logger.info(
-            "telegram_decision",
-            chat_id=ctx.chat_id,
-            user_id=ctx.user_id,
-            action=verdict.action.value,
-            rule=verdict.rule_code,
-        )
-        try:
-            if verdict.action == ActionType.DELETE:
-                await self.bot.delete_message(ctx.chat_id, ctx.message_id)
-            elif verdict.action == ActionType.WARN:
-                await self.bot.send_message(
-                    ctx.chat_id,
-                    f"⚠️ Warning for @{ctx.username or ctx.user_id}: {verdict.reason}",
-                    reply_to_message_id=ctx.message_id,
-                )
-            elif verdict.action == ActionType.MUTE:
-                until = datetime.now(timezone.utc) + timedelta(minutes=15)
-                await self.bot.restrict_chat_member(
-                    ctx.chat_id,
-                    ctx.user_id,
-                    permissions=ChatPermissions(can_send_messages=False),
-                    until_date=until,
-                )
-                await self.bot.send_message(
-                    ctx.chat_id,
-                    f"🔇 User @{ctx.username or ctx.user_id} muted: {verdict.reason}",
-                )
-            elif verdict.action == ActionType.BAN:
-                await self.bot.ban_chat_member(ctx.chat_id, ctx.user_id)
-                await self.bot.send_message(
-                    ctx.chat_id,
-                    f"🚫 User @{ctx.username or ctx.user_id} banned: {verdict.reason}",
-                )
-        except Exception as exc:  # pragma: no cover - network errors
-            logger.error(
-                "telegram_decision_error",
-                error=str(exc),
-                action=verdict.action.value,
-                chat_id=ctx.chat_id,
-            )
-
     async def run(self) -> None:
         await self.coordinator.start()
         try:
@@ -353,129 +462,238 @@ class TelegramModerationApp:
         if message.chat.type != ChatType.PRIVATE:
             await message.reply("Open a private chat with me and send /panel to manage moderation.")
             return
-        admin_chats = await self._available_admin_chats(message.from_user.id)
-        if not admin_chats:
-            await message.reply(
-                "No chats detected yet. Add me to groups where you are admin and send any message there, "
-                "or type `set <chat_id>` to choose a chat manually.",
-                parse_mode="Markdown",
-            )
-            return
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=title or str(chat_id),
-                        callback_data=f"panel:chat:{chat_id}",
-                    )
-                ]
-                for chat_id, title in admin_chats[:12]
-            ]
-        )
-        await message.reply(
-            "Select a chat to manage rules:",
-            reply_markup=keyboard,
-        )
+        self._admin_sessions.pop(message.from_user.id, None)
+        await self._prompt_chat_selection(message, message.from_user.id, replace=False)
 
     async def _handle_panel_select(self, callback: CallbackQuery) -> None:
         await callback.answer()
-        chat_id = int(callback.data.split(":")[2])
-        admin_chats = dict(await self._available_admin_chats(callback.from_user.id))
-        if chat_id not in admin_chats:
-            await callback.message.edit_text("You are not an admin in that chat or it is unavailable.")
-            return
-        self._admin_sessions[callback.from_user.id] = {"chat_id": chat_id}
-        rules = await self.coordinator.list_rules(chat_id)
-        rule_lines = "\n".join(
-            f"- {rule.rule_id} [{rule.layer.value}] {rule.action.value}: {rule.description}"
-            for rule in rules
-        ) or "No rules configured yet."
-        help_text = f"Now controlling chat: {admin_chats[chat_id]} ({chat_id}).\n\n{PANEL_HELP}"
-        await callback.message.edit_text(
-            f"{help_text}\n\nCurrent rules:\n{rule_lines}",
-            parse_mode="Markdown",
+        raw_chat_id = callback.data.split(":")[2]
+        user_id = callback.from_user.id
+        admin_chats = dict(await self._available_admin_chats(user_id))
+        if raw_chat_id == "global":
+            chat_id = None
+            chat_title = "Глобальные правила"
+        else:
+            try:
+                chat_id = int(raw_chat_id)
+            except ValueError:
+                await callback.message.edit_text("Некорректный идентификатор чата.")
+                return
+            if chat_id not in admin_chats:
+                await callback.message.edit_text("Вы не администратор в этом чате или он недоступен.")
+                return
+            chat_title = admin_chats[chat_id]
+        session = self._admin_sessions.setdefault(user_id, {})
+        session.update(
+            {
+                "chat_id": chat_id,
+                "chat_title": chat_title,
+                "pending_action": None,
+                "last_status": "Используйте кнопки ниже, чтобы управлять правилами.",
+            }
         )
+        await self._render_admin_panel(session=session, message=callback.message, user_id=user_id)
+
+    async def _handle_panel_action(self, callback: CallbackQuery) -> None:
+        await callback.answer()
+        parts = callback.data.split(":", 3)
+        if len(parts) < 4:
+            return
+        _, _, action, chat_key = parts
+        user_id = callback.from_user.id
+        session = self._admin_sessions.get(user_id)
+        if not session:
+            await callback.message.answer("Сессия устарела. Отправьте /panel ещё раз.")
+            return
+        expected_key = "global" if session.get("chat_id") is None else str(session.get("chat_id"))
+        if chat_key != expected_key:
+            await self._render_admin_panel(session=session, message=callback.message, user_id=user_id)
+            return
+
+        chat_id = session.get("chat_id")
+        if action == "list":
+            rules = await self.coordinator.list_rules(chat_id)
+            await callback.message.answer(self._format_rules_markdown(rules), parse_mode="Markdown")
+            session["last_status"] = "📋 Отправил актуальный список правил ниже."
+        elif action == "refresh":
+            session["last_status"] = "🔄 Панель обновлена."
+        elif action == "add":
+            if chat_id is None:
+                session["pending_action"] = "add_global"
+                prompt = (
+                    "Отправьте глобальное правило в формате `warn[:1h] описание`. "
+                    "Пример: `ban продажа наркотиков`. Напишите `cancel`, чтобы отменить."
+                )
+            else:
+                session["pending_action"] = "add"
+                prompt = (
+                    "Отправьте новое правило в формате `warn[:10m] описание`. "
+                    "Можно добавлять `category=...` или `layer=...`. Напишите `cancel`, чтобы отменить."
+                )
+            session["last_status"] = None
+            await callback.message.answer(prompt, parse_mode="Markdown")
+        elif action == "remove":
+            session["pending_action"] = "remove"
+            session["last_status"] = None
+            await callback.message.answer(
+                "Отправьте `rule_id`, который нужно удалить. Напишите `cancel`, чтобы отменить.",
+                parse_mode="Markdown",
+            )
+        elif action == "help":
+            await callback.message.answer(PANEL_HELP, parse_mode="Markdown")
+            session["last_status"] = "ℹ️ Отправил памятку ниже."
+        elif action == "switch":
+            session["pending_action"] = None
+            session["last_status"] = "Выберите чат из списка."
+            await self._prompt_chat_selection(callback.message, user_id, replace=True)
+            return
+        else:
+            session["last_status"] = "Неизвестное действие."
+        await self._render_admin_panel(session=session, message=callback.message, user_id=user_id)
 
     async def _handle_admin_text(self, message: Message) -> None:
         if message.text and message.text.startswith("/"):
             return  # slash commands handled separately
-        session = self._admin_sessions.get(message.from_user.id)
-        if not session:
+        user_id = message.from_user.id
+        session = self._admin_sessions.get(user_id)
+        if not session or "chat_id" not in session:
             await message.answer("Send /panel to choose a chat to manage.")
             return
-        chat_id = session["chat_id"]
-        text = (message.text or "").strip()
-        if text.lower() in {"help", ""}:
+
+        text = (message.text or message.caption or "").strip()
+        if not text:
             await message.answer(PANEL_HELP, parse_mode="Markdown")
             return
-        if text.lower() == "list":
-            rules = await self.coordinator.list_rules(chat_id)
-            if not rules:
-                await message.answer("No rules configured yet.")
+
+        pending = session.get("pending_action")
+        if pending:
+            lower = text.lower()
+            if lower == "cancel":
+                session["pending_action"] = None
+                session["last_status"] = "✋ Действие отменено."
+                await message.answer("Отменено. Выберите следующее действие в панели.")
+                await self._render_admin_panel(session=session, user_id=user_id)
                 return
-            lines = [
-                f"{rule.rule_id} [{rule.layer.value}] {rule.action.value}: {rule.description}"
-                for rule in rules
-            ]
-            await message.answer("\n".join(lines))
+            if pending == "add":
+                rule = await self._admin_add_rule(message, session.get("chat_id"), command=f"add {text}")
+                session["last_status"] = (
+                    f"✅ Добавлено правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
+                )
+            elif pending == "add_global":
+                rule = await self._admin_add_rule(message, chat_id=None, command=f"add-global {text}")
+                session["last_status"] = (
+                    f"✅ Добавлено глобальное правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
+                )
+            elif pending == "remove":
+                rule_id = text
+                try:
+                    await self.coordinator.remove_rule(rule_id)
+                    await message.answer(f"Removed rule {rule_id}")
+                    session["last_status"] = f"🗑 Удалено правило `{rule_id}`."
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error("remove_rule_failed", error=str(exc))
+                    await message.answer("Failed to remove rule. Check logs.")
+                    session["last_status"] = "⚠️ Не удалось удалить правило."
+            session["pending_action"] = None
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
-        if text.lower().startswith("remove"):
+
+        lower = text.lower()
+        chat_id = session.get("chat_id")
+        if lower == "help":
+            await message.answer(PANEL_HELP, parse_mode="Markdown")
+            session["last_status"] = "ℹ️ Памятка отправлена."
+            await self._render_admin_panel(session=session, user_id=user_id)
+            return
+        if lower == "list":
+            rules = await self.coordinator.list_rules(chat_id)
+            await message.answer(self._format_rules_markdown(rules), parse_mode="Markdown")
+            session["last_status"] = "📋 Список правил отправлен ниже."
+            await self._render_admin_panel(session=session, user_id=user_id)
+            return
+        if lower.startswith("remove"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
                 await message.answer("Usage: remove <rule_id>")
                 return
-            if chat_id is not None and not await self._ensure_admin(chat_id, message.from_user.id):
+            if chat_id is not None and not await self._ensure_admin(chat_id, user_id):
                 await message.answer("You are not an admin in that chat.")
                 return
             try:
                 await self.coordinator.remove_rule(parts[1])
+                await message.answer(f"Removed rule {parts[1]}")
+                session["last_status"] = f"🗑 Удалено правило `{parts[1]}`."
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error("remove_rule_failed", error=str(exc))
                 await message.answer("Failed to remove rule. Check logs.")
-                return
-            await message.answer(f"Removed rule {parts[1]}")
+                session["last_status"] = "⚠️ Не удалось удалить правило."
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
-        if text.lower().startswith("set"):
+        if lower.startswith("set"):
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await message.answer("Usage: set <chat_id>")
+                await message.answer("Usage: set <chat_id|global>")
+                return
+            target = parts[1].strip().lower()
+            if target == "global":
+                session.update({"chat_id": None, "chat_title": "Глобальные правила", "pending_action": None})
+                await message.answer("Switched to global rules. Type `list` to see rules.", parse_mode="Markdown")
+                await self._render_admin_panel(session=session, user_id=user_id)
                 return
             try:
-                new_chat_id = int(parts[1])
+                new_chat_id = int(target)
             except ValueError:
-                await message.answer("Chat ID must be an integer.")
+                await message.answer("Chat ID must be an integer or `global`.")
                 return
-            if not await self._ensure_admin(new_chat_id, message.from_user.id):
+            if not await self._ensure_admin(new_chat_id, user_id):
                 await message.answer("You are not an admin in that chat.")
                 return
-            self._admin_sessions[message.from_user.id] = {"chat_id": new_chat_id}
+            session.update(
+                {
+                    "chat_id": new_chat_id,
+                    "chat_title": self._chat_cache.get(new_chat_id, str(new_chat_id)),
+                    "pending_action": None,
+                }
+            )
             await message.answer(f"Switched to chat {new_chat_id}. Type `list` to see rules.")
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
-        if text.lower().startswith("add-global"):
-            await self._admin_add_rule(message, chat_id=None, command=text)
+        if lower.startswith("add-global"):
+            rule = await self._admin_add_rule(message, chat_id=None, command=text)
+            session["last_status"] = (
+                f"✅ Добавлено глобальное правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
+            )
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
-        if text.lower().startswith("add"):
-            await self._admin_add_rule(message, chat_id=chat_id, command=text)
+        if lower.startswith("add"):
+            if chat_id is None:
+                await message.answer("Выберите чат или используйте `add-global` для глобального правила.")
+                return
+            rule = await self._admin_add_rule(message, chat_id=chat_id, command=text)
+            session["last_status"] = (
+                f"✅ Добавлено правило `{rule.rule_id}`." if rule else "⚠️ Не удалось добавить правило."
+            )
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
         await message.answer("Unknown command. Type 'help' for instructions.")
 
-    async def _admin_add_rule(self, message: Message, chat_id: Optional[int], command: str) -> None:
+    async def _admin_add_rule(self, message: Message, chat_id: Optional[int], command: str) -> Optional[ModerationRule]:
         tokens = shlex.split(command)
         if len(tokens) < 3:
             await message.answer("Usage: add <action[:duration]> [layer=...] [type=...] [category=...] <description>")
-            return
+            return None
         _, action_token, *rest_tokens = tokens
         try:
             action, duration = self._parse_action_token(action_token)
         except ValueError as exc:
             await message.answer(str(exc))
-            return
+            return None
 
         try:
             layer_override, rule_type_override, category, pattern, description = self._extract_rule_metadata(rest_tokens)
         except ValueError as exc:
             await message.answer(str(exc))
-            return
+            return None
 
         if duration is None and description:
             first_word = description.split(maxsplit=1)[0]
@@ -484,14 +702,14 @@ class TelegramModerationApp:
                     duration = self._parse_duration(first_word)
                 except ValueError as exc:
                     await message.answer(str(exc))
-                    return
+                    return None
                 description = description.split(maxsplit=1)[1] if ' ' in description else ''
         if not description:
             await message.answer("Please provide rule description.")
-            return
+            return None
         if chat_id is not None and not await self._ensure_admin(chat_id, message.from_user.id):
             await message.answer("You are not an admin in that chat.")
-            return
+            return None
         try:
             rule = await self.coordinator.add_rule(
                 description,
@@ -506,9 +724,11 @@ class TelegramModerationApp:
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("panel_add_rule_failed", error=str(exc))
             await message.answer("Failed to add rule. Check logs for details.")
-            return
+            return None
         scope_label = "global" if chat_id is None else f"chat {chat_id}"
         await message.answer(f"Rule {rule.rule_id} added for {scope_label}.")
+        return rule
+
     async def _available_admin_chats(self, user_id: int) -> list[tuple[int, str]]:
         chats = []
         for chat_id, title in self._chat_cache.items():

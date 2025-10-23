@@ -41,7 +41,8 @@ class ChatGPTLayer(ModerationLayer):
             "Strict moderation. Output format: single JSON only.\n"
             "{\"violation\":bool,\"category\":str,\"severity\":str,\"action\":str,\"reason\":str}\n"
             "Allowed actions: warn, delete, mute, ban, none (lowercase).\n"
-            "If user content lists allowed categories, pick exactly one of them; otherwise choose the closest match.\n"
+            "If the user message lists allowed categories, you MUST pick one of them only when the content clearly fits.\n"
+            "If none of the allowed categories apply, respond with violation=false and action='none'.\n"
             "No text before/after JSON. No explanations. No markdown. No reasoning."
         )
 
@@ -269,7 +270,7 @@ class ChatGPTLayer(ModerationLayer):
             lines.extend(
                 [
                     "",
-                    "Allowed categories (return exactly one value from this list):",
+                    "Allowed categories (return a value from this list only if it clearly matches; otherwise reply with violation=false):",
                     joined,
                 ]
             )
