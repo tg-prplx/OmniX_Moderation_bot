@@ -692,6 +692,7 @@ class TelegramModerationApp:
 
         if not flow:
             await callback.message.answer("Нет активного действия. Используйте меню.")
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
 
         if parts[2] == "add":
@@ -780,6 +781,7 @@ class TelegramModerationApp:
         text = (message.text or message.caption or "").strip()
         if not flow:
             await message.answer("Используйте меню ниже для управления правилами.")
+            await self._render_admin_panel(session=session, user_id=user_id)
             return
 
         lower = text.lower()
@@ -795,6 +797,7 @@ class TelegramModerationApp:
                     duration = self._parse_duration(text)
                 except ValueError:
                     await message.answer("Неверный формат. Используйте значения вроде 30s, 10m, 2h, 3d.")
+                    await self._render_admin_panel(session=session, user_id=user_id)
                     return
                 flow["data"]["duration"] = duration
                 await message.answer("Длительность сохранена.")
@@ -803,12 +806,14 @@ class TelegramModerationApp:
             if stage == "await_description":
                 if not text:
                     await message.answer("Описание не может быть пустым. Повторите ввод.")
+                    await self._render_admin_panel(session=session, user_id=user_id)
                     return
                 await self._complete_add_flow(session, user_id, text)
                 await self._render_admin_panel(session=session, user_id=user_id)
                 return
 
         await message.answer("Используйте меню ниже.")
+        await self._render_admin_panel(session=session, user_id=user_id)
 
     async def _available_admin_chats(self, user_id: int) -> list[tuple[int, str]]:
         chats = []
