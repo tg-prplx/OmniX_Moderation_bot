@@ -34,8 +34,8 @@ logger = structlog.get_logger(__name__)
 PANEL_HELP = (
     "🔧 *Панель администратора*\n"
     "• `list` — показать правила выбранного чата\n"
-    "• `add <действие[:время]> <описание>` — добавить правило в чат\n"
-    "• `add-global <действие[:время]> <описание>` — добавить глобальное правило\n"
+    "• `add <действие:время> <описание>` — добавить правило в чат (например, `mute:10m реклама`)\n"
+    "• `add-global <действие:время> <описание>` — добавить глобальное правило\n"
     "• `remove <rule_id>` — удалить правило\n"
     "• `set <chat_id>` — переключиться на другой чат вручную\n"
     "• `help` — показать памятку\n"
@@ -521,13 +521,13 @@ class TelegramModerationApp:
             if chat_id is None:
                 session["pending_action"] = "add_global"
                 prompt = (
-                    "Отправьте глобальное правило в формате `warn[:1h] описание`. "
+                    "Отправьте глобальное правило в формате `warn:1h описание` (время необязательно). "
                     "Пример: `ban продажа наркотиков`. Напишите `cancel`, чтобы отменить."
                 )
             else:
                 session["pending_action"] = "add"
                 prompt = (
-                    "Отправьте новое правило в формате `warn[:10m] описание`. "
+                    "Отправьте новое правило в формате `warn:10m описание` (время необязательно). "
                     "Можно добавлять `category=...` или `layer=...`. Напишите `cancel`, чтобы отменить."
                 )
             session["last_status"] = None
@@ -586,6 +586,12 @@ class TelegramModerationApp:
                 )
             elif pending == "remove":
                 rule_id = text
+                if lower.startswith("remove"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        await message.answer("Укажите `rule_id` после команды или отправьте `cancel`.")
+                        return
+                    rule_id = parts[1].strip()
                 try:
                     await self.coordinator.remove_rule(rule_id)
                     await message.answer(f"Removed rule {rule_id}")
@@ -783,13 +789,20 @@ class TelegramModerationApp:
         return layer_override, rule_type_override, category, pattern, description
 
     def _parse_action_token(self, token: str) -> tuple[ActionType, Optional[int]]:
-        base = token
+        raw = token.strip()
+        if raw.startswith("/"):
+            raw = raw.lstrip("/")
+        normalized = raw.replace("[", "").replace("]", "")
+        base = normalized
         duration = None
-        if ":" in token:
-            base, duration_part = token.split(":", 1)
+        if ":" in normalized:
+            base, duration_part = normalized.split(":", 1)
+            duration_part = duration_part.strip()
             if not duration_part:
                 raise ValueError("Duration must follow the action, e.g. mute:10m")
-            duration = self._parse_duration(duration_part)
+            # allow formats like "10m текст" by taking first token as duration
+            duration_token = duration_part.split()[0]
+            duration = self._parse_duration(duration_token)
         try:
             action = ActionType(base.lower())
         except ValueError as exc:
